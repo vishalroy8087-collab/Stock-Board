@@ -91,17 +91,48 @@ def add_history(action, rack, cell_no, part_no, qty, user, note=""):
         },
     )
 
+# ---- Helper functions to ensure consistent mapping ----
+def cell_no_to_indices(rack, cell_no):
+    """
+    Convert 1-based cell_no (bottom-left = 1, left->right, bottom->top)
+    to internal array indices (row_idx, col_idx) where array[0] is top row.
+    """
+    cols = rack["cols"]
+    rows = rack["rows"]
+    if cell_no < 1 or cell_no > rack["spaces"]:
+        raise ValueError("cell_no out of range")
+    row_order_from_bottom = (cell_no - 1) // cols  # 0-based bottom row = 0
+    row_idx = rows - 1 - row_order_from_bottom    # flip because array[0] is top
+    col_idx = (cell_no - 1) % cols
+    return row_idx, col_idx
+
+def indices_to_cell_no(rack, row_idx, col_idx):
+    """
+    Convert internal array indices back to 1-based cell_no (bottom-left = 1).
+    """
+    cols = rack["cols"]
+    rows = rack["rows"]
+    if row_idx < 0 or row_idx >= rows or col_idx < 0 or col_idx >= cols:
+        raise ValueError("indices out of range")
+    row_order_from_bottom = rows - 1 - row_idx
+    return row_order_from_bottom * cols + col_idx + 1
+
 def prepare_rack_grid_csv():
-    rows = []
+    """
+    Prepare CSV rows in the same bottom-up cell order displayed to users.
+    """
+    rows_out = []
     for rn, rack in st.session_state.racks.items():
         cell_no = 1
-        for i in range(rack["rows"]):
-            for j in range(rack["cols"]):
+        # iterate bottom row first to match displayed numbering
+        for row_order in range(rack["rows"]):
+            display_row = rack["rows"] - 1 - row_order
+            for col in range(rack["cols"]):
                 if cell_no > rack["spaces"]:
                     break
-                c = rack["array"][i][j]
+                c = rack["array"][display_row][col]
                 pm = st.session_state.part_master.get(c["Part No"], {}) if c["Part No"] else {}
-                rows.append(
+                rows_out.append(
                     {
                         "Rack": rn,
                         "Cell": cell_no,
@@ -113,7 +144,7 @@ def prepare_rack_grid_csv():
                     }
                 )
                 cell_no += 1
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows_out)
 
 def prepare_part_master_csv_bytes():
     df = pd.DataFrame.from_dict(st.session_state.part_master, orient="index").reset_index()
@@ -216,7 +247,6 @@ if page == "Input" and can_input:
     st.subheader("Stock Input")
     rack_ui = st.selectbox("Rack", options=list(st.session_state.racks.keys()))
     rack_data = st.session_state.racks[rack_ui]
-    ROWS, COLS = rack_data["rows"], rack_data["cols"]
     SPACES = rack_data["spaces"]
 
     with st.form("stock_form", clear_on_submit=True):
@@ -225,28 +255,32 @@ if page == "Input" and can_input:
         qty = st.number_input("Quantity", min_value=1, step=1)
         action = st.radio("Action", ["Add", "Subtract"], horizontal=True)
         if st.form_submit_button("Apply"):
-            row_idx = (cell_no - 1) // COLS
-            col_idx = (cell_no - 1) % COLS
-            cell = rack_data["array"][row_idx][col_idx]
-            if action == "Add":
-                if cell["Part No"] in (None, part_no):
-                    if cell["Quantity"] + qty <= CELL_CAPACITY:
-                        cell["Part No"] = part_no
-                        cell["Quantity"] += qty
-                        add_history("Add", rack_ui, cell_no, part_no, qty, st.session_state.user)
-                        st.success(f"Added {qty} of {part_no} at {rack_ui} Cell {cell_no}")
+            try:
+                row_idx, col_idx = cell_no_to_indices(rack_data, cell_no)
+            except ValueError:
+                st.error("Invalid cell number")
+            else:
+                cell = rack_data["array"][row_idx][col_idx]
+                if action == "Add":
+                    if cell["Part No"] in (None, part_no):
+                        if cell["Quantity"] + qty <= CELL_CAPACITY:
+                            cell["Part No"] = part_no
+                            cell["Quantity"] += qty
+                            add_history("Add", rack_ui, cell_no, part_no, qty, st.session_state.user)
+                            st.success(f"Added {qty} of {part_no} at {rack_ui} Cell {cell_no}")
+                        else:
+                            st.error("Exceeds cell capacity")
                     else:
-                        st.error("Exceeds cell capacity")
-                else:
-                    st.error("Cell already has a different part")
-            else:  # Subtract
-                if cell["Part No"] == part_no and cell["Quantity"] >= qty:
-                    cell["Quantity"] -= qty
-                    if cell["Quantity"] == 0: cell["Part No"] = None
-                    add_history("Subtract", rack_ui, cell_no, part_no, qty, st.session_state.user)
-                    st.success(f"Subtracted {qty} from {rack_ui} Cell {cell_no}")
-                else:
-                    st.error("Mismatch or insufficient stock")
+                        st.error("Cell already has a different part")
+                else:  # Subtract
+                    if cell["Part No"] == part_no and cell["Quantity"] >= qty:
+                        cell["Quantity"] -= qty
+                        if cell["Quantity"] == 0:
+                            cell["Part No"] = None
+                        add_history("Subtract", rack_ui, cell_no, part_no, qty, st.session_state.user)
+                        st.success(f"Subtracted {qty} from {rack_ui} Cell {cell_no}")
+                    else:
+                        st.error("Mismatch or insufficient stock")
 
     st.download_button("⬇️ Download Grid CSV", data=prepare_rack_grid_csv().to_csv(index=False).encode("utf-8"), file_name="grid.csv", mime="text/csv")
 
@@ -268,7 +302,7 @@ if page == "Output" and can_output:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- Rack Layout ---
+    # --- Rack Layout (no headers) ---
     st.markdown("### Rack Layout")
     ROWS = rack["rows"]
     COLS = rack["cols"]
@@ -290,7 +324,7 @@ if page == "Output" and can_output:
     """
 
     cell_counter = 1
-    for row_order in range(ROWS):  # bottom row first
+    for row_order in range(ROWS):  # bottom row first (row_order 0 => bottom)
         display_r = ROWS - 1 - row_order
         html += "<tr>"
         for c in range(COLS):
@@ -301,10 +335,15 @@ if page == "Output" and can_output:
 
                 if not part_no or qty == 0:
                     css = "cell-empty"
-                    content = f"<div class='cell-content'><div style='font-weight:700'>Cell {cell_counter}</div><div>Empty</div></div>"
+                    content = (
+                        f"<div class='cell-content'>"
+                        f"<div style='font-weight:700'>Cell {cell_counter}</div>"
+                        f"<div style='margin-top:6px'>Empty</div>"
+                        f"</div>"
+                    )
                 else:
                     fill_ratio = qty / CELL_CAPACITY
-                    if fill_ratio == 1:
+                    if fill_ratio >= 1.0:
                         css = "cell-full"
                     elif fill_ratio >= 0.5:
                         css = "cell-mid"
@@ -314,7 +353,7 @@ if page == "Output" and can_output:
                     content = (
                         f"<div class='cell-content'>"
                         f"<div style='font-weight:700'>Cell {cell_counter}</div>"
-                        f"<div>{part_no}</div>"
+                        f"<div style='margin-top:6px'>{part_no}</div>"
                         f"<div>Qty: {qty}</div>"
                         f"<div style='font-size:12px;color:#333'>Wt: {wt} kg</div>"
                         f"</div>"
@@ -329,25 +368,32 @@ if page == "Output" and can_output:
     html += "</tbody></table></div>"
     st.markdown(html, unsafe_allow_html=True)
 
+    # --- FIFO Finder (oldest Add event that still has stock) ---
     st.subheader("FIFO Part Finder")
     search_part = st.text_input("Part No")
     if st.button("Find FIFO Cell"):
         fifo = None
+        # history[0] is most recent, so reversed() gives oldest->newest
         for ev in reversed(st.session_state.history):
-            if ev["Action"]=="Add" and ev["Part No"]==search_part:
+            if ev["Action"] == "Add" and ev["Part No"] == search_part:
                 rk, cell_no = ev["Rack"], ev["Cell"]
-                rack_check = st.session_state.racks[rk]
-                row_idx = (cell_no - 1) // rack_check["cols"]
-                col_idx = (cell_no - 1) % rack_check["cols"]
+                rack_check = st.session_state.racks.get(rk)
+                if not rack_check:
+                    continue
+                try:
+                    row_idx, col_idx = cell_no_to_indices(rack_check, cell_no)
+                except ValueError:
+                    continue
                 cell = rack_check["array"][row_idx][col_idx]
-                if cell["Part No"]==search_part and cell["Quantity"]>0:
-                    fifo = ev
+                if cell["Part No"] == search_part and cell["Quantity"] > 0:
+                    fifo = {"Rack": rk, "Cell": cell_no, "Qty": cell["Quantity"]}
                     break
         if fifo:
-            st.success(f"FIFO pick: Rack {fifo['Rack']} Cell {fifo['Cell']} (Qty: {cell['Quantity']})")
+            st.success(f"FIFO pick: Rack {fifo['Rack']} Cell {fifo['Cell']} (Qty: {fifo['Qty']})")
         else:
             st.warning("No FIFO candidate found")
 
+    # --- History Log ---
     st.subheader("History Log")
     if st.session_state.history:
         df_hist = pd.DataFrame(st.session_state.history)[["Timestamp","User","Action","Rack","Cell","Part No","Quantity"]]
