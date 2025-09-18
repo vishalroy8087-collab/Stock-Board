@@ -99,17 +99,35 @@ def add_history(action, rack, cell_no, part_no, qty, user, note=""):
         },
     )
 
+# --- NEW: Helpers for consistent cell mapping ---
+def cell_no_to_indices(rack, cell_no):
+    """Map 1-based cell number to array indices, bottom-up numbering."""
+    cols = rack["cols"]
+    rows = rack["rows"]
+    row_order = (cell_no - 1) // cols  # bottom-up row index
+    row_idx = rows - 1 - row_order     # flip because array[0] is top
+    col_idx = (cell_no - 1) % cols
+    return row_idx, col_idx
+
+def indices_to_cell_no(rack, row_idx, col_idx):
+    """Map array indices back to 1-based cell number (bottom-up)."""
+    cols = rack["cols"]
+    rows = rack["rows"]
+    row_order = rows - 1 - row_idx
+    return row_order * cols + col_idx + 1
+
 def prepare_rack_grid_csv():
-    rows = []
+    rows_out = []
     for rn, rack in st.session_state.racks.items():
         cell_no = 1
-        for i in range(rack["rows"]):
+        for row_order in range(rack["rows"]):  # bottom row first
+            display_row = rack["rows"] - 1 - row_order
             for j in range(rack["cols"]):
                 if cell_no > rack["spaces"]:
                     break
-                c = rack["array"][i][j]
+                c = rack["array"][display_row][j]
                 pm = st.session_state.part_master.get(c["Part No"], {}) if c["Part No"] else {}
-                rows.append(
+                rows_out.append(
                     {
                         "Rack": rn,
                         "Cell": cell_no,
@@ -121,7 +139,7 @@ def prepare_rack_grid_csv():
                     }
                 )
                 cell_no += 1
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows_out)
 
 def prepare_part_master_csv_bytes():
     df = pd.DataFrame.from_dict(st.session_state.part_master, orient="index").reset_index()
@@ -244,7 +262,6 @@ if page == "Input" and can_input:
     st.subheader("Stock Input")
     rack_ui = st.selectbox("Rack", options=list(st.session_state.racks.keys()))
     rack_data = st.session_state.racks[rack_ui]
-    ROWS, COLS = rack_data["rows"], rack_data["cols"]
     SPACES = rack_data["spaces"]
 
     with st.form("stock_form", clear_on_submit=True):
@@ -253,8 +270,7 @@ if page == "Input" and can_input:
         qty = st.number_input("Quantity", min_value=1, step=1)
         action = st.radio("Action", ["Add", "Subtract"], horizontal=True)
         if st.form_submit_button("Apply"):
-            row_idx = (cell_no - 1) // COLS
-            col_idx = (cell_no - 1) % COLS
+            row_idx, col_idx = cell_no_to_indices(rack_data, cell_no)
             cell = rack_data["array"][row_idx][col_idx]
             if action == "Add":
                 if cell["Part No"] in (None, part_no):
@@ -286,7 +302,7 @@ if page == "Output" and can_output:
     out_rack = st.selectbox("Select Rack to View", options=list(st.session_state.racks.keys()))
     rack = st.session_state.racks[out_rack]
 
-    # --- NEW VISUAL TABLE ---
+    # --- Rack layout ---
     st.markdown("### Rack Layout")
     ROWS = rack["rows"]
     COLS = rack["cols"]
@@ -314,9 +330,10 @@ if page == "Output" and can_output:
     html += "</tr></thead><tbody>"
 
     cell_counter = 1
-    for display_r in range(ROWS - 1, -1, -1):
+    for row_order in range(ROWS):  # bottom row first
+        display_r = ROWS - 1 - row_order
         html += "<tr>"
-        html += f"<td class='row-label'>Row {display_r + 1}</td>"
+        html += f"<td class='row-label'>Row {row_order + 1}</td>"
         for c in range(COLS):
             if cell_counter <= SPACES:
                 cell_obj = rack["array"][display_r][c]
@@ -349,18 +366,18 @@ if page == "Output" and can_output:
     html += "</tbody></table></div>"
     st.markdown(html, unsafe_allow_html=True)
 
+    # --- FIFO Finder ---
     st.subheader("FIFO Part Finder")
     search_part = st.text_input("Part No")
     if st.button("Find FIFO Cell"):
         fifo = None
         for ev in reversed(st.session_state.history):
-            if ev["Action"]=="Add" and ev["Part No"]==search_part:
+            if ev["Action"] == "Add" and ev["Part No"] == search_part:
                 rk, cell_no = ev["Rack"], ev["Cell"]
                 rack_check = st.session_state.racks[rk]
-                row_idx = (cell_no - 1) // rack_check["cols"]
-                col_idx = (cell_no - 1) % rack_check["cols"]
+                row_idx, col_idx = cell_no_to_indices(rack_check, cell_no)
                 cell = rack_check["array"][row_idx][col_idx]
-                if cell["Part No"]==search_part and cell["Quantity"]>0:
+                if cell["Part No"] == search_part and cell["Quantity"] > 0:
                     fifo = ev
                     break
         if fifo:
@@ -368,6 +385,7 @@ if page == "Output" and can_output:
         else:
             st.warning("No FIFO candidate found")
 
+    # --- History Log ---
     st.subheader("History Log")
     if st.session_state.history:
         df_hist = pd.DataFrame(st.session_state.history)[["Timestamp","User","Action","Rack","Cell","Part No","Quantity"]]
