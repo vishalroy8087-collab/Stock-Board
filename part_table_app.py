@@ -76,14 +76,6 @@ def cell_total_weight(cell):
         return qty * pm.get("Weight", 0.0) + PACKAGING_WEIGHT
     return 0.0
 
-def total_weight_all():
-    return sum(
-        cell_total_weight(c)
-        for rack in st.session_state.racks.values()
-        for row in rack["array"]
-        for c in row
-    )
-
 def add_history(action, rack, cell_no, part_no, qty, user, note=""):
     st.session_state.history.insert(
         0,
@@ -99,35 +91,17 @@ def add_history(action, rack, cell_no, part_no, qty, user, note=""):
         },
     )
 
-# --- NEW: Helpers for consistent cell mapping ---
-def cell_no_to_indices(rack, cell_no):
-    """Map 1-based cell number to array indices, bottom-up numbering."""
-    cols = rack["cols"]
-    rows = rack["rows"]
-    row_order = (cell_no - 1) // cols  # bottom-up row index
-    row_idx = rows - 1 - row_order     # flip because array[0] is top
-    col_idx = (cell_no - 1) % cols
-    return row_idx, col_idx
-
-def indices_to_cell_no(rack, row_idx, col_idx):
-    """Map array indices back to 1-based cell number (bottom-up)."""
-    cols = rack["cols"]
-    rows = rack["rows"]
-    row_order = rows - 1 - row_idx
-    return row_order * cols + col_idx + 1
-
 def prepare_rack_grid_csv():
-    rows_out = []
+    rows = []
     for rn, rack in st.session_state.racks.items():
         cell_no = 1
-        for row_order in range(rack["rows"]):  # bottom row first
-            display_row = rack["rows"] - 1 - row_order
+        for i in range(rack["rows"]):
             for j in range(rack["cols"]):
                 if cell_no > rack["spaces"]:
                     break
-                c = rack["array"][display_row][j]
+                c = rack["array"][i][j]
                 pm = st.session_state.part_master.get(c["Part No"], {}) if c["Part No"] else {}
-                rows_out.append(
+                rows.append(
                     {
                         "Rack": rn,
                         "Cell": cell_no,
@@ -139,7 +113,7 @@ def prepare_rack_grid_csv():
                     }
                 )
                 cell_no += 1
-    return pd.DataFrame(rows_out)
+    return pd.DataFrame(rows)
 
 def prepare_part_master_csv_bytes():
     df = pd.DataFrame.from_dict(st.session_state.part_master, orient="index").reset_index()
@@ -232,26 +206,6 @@ if page == "Master" and can_master:
                 add_history("Master Update", "-", "-", pn, 0, st.session_state.user)
                 st.success(f"Updated master for {pn}")
 
-    # Bulk upload
-    st.markdown("### Bulk Upload Part Master")
-    uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx"])
-    if uploaded_file:
-        try:
-            df = pd.read_excel(uploaded_file)
-            if {"Part No", "Weight", "Customer", "Tube Length"}.issubset(df.columns):
-                for _, row in df.iterrows():
-                    pn = str(row["Part No"])
-                    st.session_state.part_master[pn] = {
-                        "Weight": float(row["Weight"]),
-                        "Customer": row["Customer"],
-                        "Tube Length": int(row["Tube Length"]),
-                    }
-                st.success("Part Master updated from Excel file")
-            else:
-                st.error("Excel must contain columns: Part No, Weight, Customer, Tube Length")
-        except Exception as e:
-            st.error(f"Error reading file: {e}")
-
     st.dataframe(pd.DataFrame.from_dict(st.session_state.part_master, orient="index").reset_index().rename(columns={"index":"Part No"}))
     st.download_button("⬇️ Download Part Master CSV", data=prepare_part_master_csv_bytes(), file_name="part_master.csv", mime="text/csv")
 
@@ -262,6 +216,7 @@ if page == "Input" and can_input:
     st.subheader("Stock Input")
     rack_ui = st.selectbox("Rack", options=list(st.session_state.racks.keys()))
     rack_data = st.session_state.racks[rack_ui]
+    ROWS, COLS = rack_data["rows"], rack_data["cols"]
     SPACES = rack_data["spaces"]
 
     with st.form("stock_form", clear_on_submit=True):
@@ -270,7 +225,8 @@ if page == "Input" and can_input:
         qty = st.number_input("Quantity", min_value=1, step=1)
         action = st.radio("Action", ["Add", "Subtract"], horizontal=True)
         if st.form_submit_button("Apply"):
-            row_idx, col_idx = cell_no_to_indices(rack_data, cell_no)
+            row_idx = (cell_no - 1) // COLS
+            col_idx = (cell_no - 1) % COLS
             cell = rack_data["array"][row_idx][col_idx]
             if action == "Add":
                 if cell["Part No"] in (None, part_no):
@@ -302,7 +258,17 @@ if page == "Output" and can_output:
     out_rack = st.selectbox("Select Rack to View", options=list(st.session_state.racks.keys()))
     rack = st.session_state.racks[out_rack]
 
-    # --- Rack layout ---
+    # --- Color Legend ---
+    st.markdown("""
+    <div style="margin-bottom:10px;">
+      <span style="background:#d9fdd3; padding:4px 8px; border:1px solid #ccc; margin-right:8px;">🟩 Empty</span>
+      <span style="background:#fff9c4; padding:4px 8px; border:1px solid #ccc; margin-right:8px;">🟨 &lt;50%</span>
+      <span style="background:#ffe0b2; padding:4px 8px; border:1px solid #ccc; margin-right:8px;">🟧 ≥50%</span>
+      <span style="background:#ffcdd2; padding:4px 8px; border:1px solid #ccc;">🟥 Full</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # --- Rack Layout ---
     st.markdown("### Rack Layout")
     ROWS = rack["rows"]
     COLS = rack["cols"]
@@ -311,54 +277,51 @@ if page == "Output" and can_output:
     html = """
     <style>
       .rack-wrap { overflow-x: auto; margin-bottom: 12px; }
-      .rack-table { border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; }
-      .rack-table th, .rack-table td { border: 1px solid #e6e6e6; padding: 10px; text-align: center; vertical-align: middle; min-width:140px; }
-      .rack-table th { background:#fafafa; font-weight:700; }
-      .row-label { background:#f5f7fa; font-weight:700; width:90px; }
-      .cell-empty { background:#f2f3f4; color:#6c757d; min-height:70px; }
-      .cell-filled { background:#e6f7ea; min-height:85px; }
+      .rack-table { border-collapse: collapse; font-family: Arial, sans-serif; margin:auto; }
+      .rack-table td { border: 1px solid #e6e6e6; padding: 10px; text-align: center; vertical-align: middle; min-width:140px; }
+      .cell-empty { background:#d9fdd3; color:#2e7d32; }
+      .cell-partial { background:#fff9c4; color:#9e7700; }
+      .cell-mid { background:#ffe0b2; color:#e65100; }
+      .cell-full { background:#ffcdd2; color:#b71c1c; }
       .cell-content { font-size:14px; line-height:1.25; }
     </style>
     <div class="rack-wrap">
-    <table class="rack-table">
-      <thead>
-        <tr><th class="row-label">Row</th>
+    <table class="rack-table"><tbody>
     """
-
-    for col_h in range(1, COLS + 1):
-        html += f"<th>Col {col_h}</th>"
-    html += "</tr></thead><tbody>"
 
     cell_counter = 1
     for row_order in range(ROWS):  # bottom row first
         display_r = ROWS - 1 - row_order
         html += "<tr>"
-        html += f"<td class='row-label'>Row {row_order + 1}</td>"
         for c in range(COLS):
             if cell_counter <= SPACES:
                 cell_obj = rack["array"][display_r][c]
-                if cell_obj.get("Part No"):
+                qty = cell_obj["Quantity"]
+                part_no = cell_obj.get("Part No")
+
+                if not part_no or qty == 0:
+                    css = "cell-empty"
+                    content = f"<div class='cell-content'><div style='font-weight:700'>Cell {cell_counter}</div><div>Empty</div></div>"
+                else:
+                    fill_ratio = qty / CELL_CAPACITY
+                    if fill_ratio == 1:
+                        css = "cell-full"
+                    elif fill_ratio >= 0.5:
+                        css = "cell-mid"
+                    else:
+                        css = "cell-partial"
                     wt = round(cell_total_weight(cell_obj), 2)
                     content = (
                         f"<div class='cell-content'>"
                         f"<div style='font-weight:700'>Cell {cell_counter}</div>"
-                        f"<div style='margin-top:6px'>{cell_obj['Part No']}</div>"
-                        f"<div>Qty: {cell_obj['Quantity']}</div>"
-                        f"<div style='font-size:12px;margin-top:4px;color:#333'>Wt: {wt} kg</div>"
+                        f"<div>{part_no}</div>"
+                        f"<div>Qty: {qty}</div>"
+                        f"<div style='font-size:12px;color:#333'>Wt: {wt} kg</div>"
                         f"</div>"
                     )
-                    css = "cell-filled"
-                else:
-                    content = (
-                        f"<div class='cell-content'>"
-                        f"<div style='font-weight:700'>Cell {cell_counter}</div>"
-                        f"<div style='color:#6c757d;margin-top:6px'>Empty</div>"
-                        f"</div>"
-                    )
-                    css = "cell-empty"
             else:
-                content = ""
                 css = "cell-empty"
+                content = ""
             html += f"<td class='{css}'>{content}</td>"
             cell_counter += 1
         html += "</tr>"
@@ -366,18 +329,18 @@ if page == "Output" and can_output:
     html += "</tbody></table></div>"
     st.markdown(html, unsafe_allow_html=True)
 
-    # --- FIFO Finder ---
     st.subheader("FIFO Part Finder")
     search_part = st.text_input("Part No")
     if st.button("Find FIFO Cell"):
         fifo = None
         for ev in reversed(st.session_state.history):
-            if ev["Action"] == "Add" and ev["Part No"] == search_part:
+            if ev["Action"]=="Add" and ev["Part No"]==search_part:
                 rk, cell_no = ev["Rack"], ev["Cell"]
                 rack_check = st.session_state.racks[rk]
-                row_idx, col_idx = cell_no_to_indices(rack_check, cell_no)
+                row_idx = (cell_no - 1) // rack_check["cols"]
+                col_idx = (cell_no - 1) % rack_check["cols"]
                 cell = rack_check["array"][row_idx][col_idx]
-                if cell["Part No"] == search_part and cell["Quantity"] > 0:
+                if cell["Part No"]==search_part and cell["Quantity"]>0:
                     fifo = ev
                     break
         if fifo:
@@ -385,7 +348,6 @@ if page == "Output" and can_output:
         else:
             st.warning("No FIFO candidate found")
 
-    # --- History Log ---
     st.subheader("History Log")
     if st.session_state.history:
         df_hist = pd.DataFrame(st.session_state.history)[["Timestamp","User","Action","Rack","Cell","Part No","Quantity"]]
